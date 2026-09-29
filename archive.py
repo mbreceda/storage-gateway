@@ -27,12 +27,15 @@ el motivo y el objeto se queda en R2. Es correcto: R2 tiene 10 GB gratis y sin
 coste de salida, y un archivo grande es justo el que mas conviene tener ahi.
 """
 
+import asyncio
 import json
 import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import mtproto_upload
 
 BACKEND = os.environ["BACKEND_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
@@ -56,29 +59,23 @@ if not BACKEND.startswith("http"):
 # verdad: rotar una no rotaria la otra, y el fallo apareceria como
 # `chat not found` sin pista del motivo.
 
-# Tope real de la Bot API, y **el que manda es el de bajada**.
-#
-# Subir acepta 50 MB -probado con 51-, pero bajar por `getFile` corta en 20:
-# medido, 19 MB pasa y 21 MB responde `Bad Request: file is too big`.
-#
-# **Archivar por encima de 20 MB seria perder el archivo.** Subiria bien, se
-# borraria de R2, y despues nadie podria bajarlo: el archivado pareceria
-# funcionar y el archivo quedaria inaccesible. Es un fallo silencioso y
-# destructivo, y por eso el tope se pone por el lado conservador.
-#
-# Los archivos mayores se quedan en R2. No es un problema: 10 GB gratis y cero
-# coste de salida, y un video grande es justo el que mas conviene tener ahi.
-MAX_BOT_API_BYTES = 20 * 1024 * 1024
+# Tope real de la Bot API, y **el que manda es el de bajada**. Vive en
+# `mtproto_upload` junto al de MTProto, para que los dos numeros que deciden el
+# camino esten en el mismo sitio. Ver ese modulo.
 
 # Cuantos objetos procesa una corrida.
 #
 # **Mas de uno, y con tope.** El cron corre cada 30 minutos: si solo se
-# procesara uno, un lote de 20 archivos tardaria 10 horas. Y sin tope, una
-# corrida se acercaria al limite de 350 minutos y dejaria el siguiente lote
+# procesara uno, un lote de 20 archivos tardaria 10 horas.
+#
+# **Baja de 10 a 3 al abrir el camino MTProto.** Con la Bot API, un archivo son
+# segundos: 10 por corrida eran holgados. Por MTProto un archivo de 2 GB tarda
+# entre 10 y 30 minutos entre bajarlo de R2 y subirlo a Telegram, asi que 10
+# objetos se acercarian al tope de 350 minutos y dejarian el siguiente lote
 # esperando a que termine.
 #
 # Se para al llegar al tope o al primer fallo, lo que pase antes.
-MAX_POR_CORRIDA = int(os.environ.get("ARCHIVE_MAX_PER_RUN", "10"))
+MAX_POR_CORRIDA = int(os.environ.get("ARCHIVE_MAX_PER_RUN", "3"))
 
 WORKER_ID = os.environ.get("GITHUB_RUN_ID", "local")
 API = f"{BACKEND}/storage/api/archive"
@@ -230,17 +227,20 @@ def _claim() -> dict | None:
 
 
 def _archive_one(item: dict) -> int:
-    """Archiva un objeto ya reclamado. 0 si termino bien, 1 si fallo."""
-    oid = item["id"]
-    print(f"reclamado {oid} ({item['size']} bytes) de {item['project']}")
+    """Archiva un objeto ya reclamado. 0 si termino bien, 1 si fallo.
 
-    # **Se suelta antes de bajar, no despues.** Si se empezara a bajar un
-    # archivo de 2 GB para luego descubrir que no cabe, se habrian gastado los
-    # minutos y el ancho de banda para nada.
-    if item["size"] > MAX_BOT_API_BYTES:
+    **Dos caminos segun el tamano, y no es una optimizacion.** La Bot API solo
+    entrega archivos de hasta 20 MB, asi que todo lo que pase de ahi tiene que ir
+    por MTProto o queda inaccesible. Ver `mtproto_upload.py`.
+    """
+    oid = item["id"]
+    tam = item["size"]
+    print(f"reclamado {oid} ({tam} bytes) de {item['project']}")
+
+    if tam > mtproto_upload.MAX_MTPROTO_BYTES:
         motivo = (
-            f"archivo de {item['size']} bytes: pasa el tope de la Bot API "
-            f"({MAX_BOT_API_BYTES}); se queda en R2"
+            f"archivo de {tam} bytes: pasa el tope de MTProto "
+            f"({mtproto_upload.MAX_MTPROTO_BYTES}); se queda en R2"
         )
         print(motivo)
         _call(f"/{oid}/release", {"error": motivo})
@@ -249,6 +249,23 @@ def _archive_one(item: dict) -> int:
     if not item.get("download_url"):
         _call(f"/{oid}/release", {"error": "el backend no pudo firmar la bajada"})
         return 1
+
+    grande = tam > mtproto_upload.MAX_BOT_API_BYTES
+    destino = f"/tmp/{oid}_{item['filename']}"
+    try:
+        if grande:
+            return _archive_via_mtproto(item, destino)
+        return _archive_via_bot_api(item, destino)
+    finally:
+        # El disco del runner es efimero, pero un archivo de 2 GB que se quede
+        # puede llenarlo y tumbar el siguiente objeto de la misma corrida.
+        if os.path.exists(destino):
+            os.unlink(destino)
+
+
+def _archive_via_bot_api(item: dict, destino: str) -> int:
+    """Camino normal: archivos de hasta 20 MB, con el bot del proyecto."""
+    oid = item["id"]
 
     # **Sin bot no se puede subir, y se dice por que.** Los tres motivos posibles
     # -el proyecto no tiene alias, el alias no existe en el pool, o `SECRET_KEY`
@@ -265,7 +282,6 @@ def _archive_one(item: dict) -> int:
         _call(f"/{oid}/release", {"error": motivo})
         return 1
 
-    destino = f"/tmp/{oid}_{item['filename']}"
     try:
         escrito = _download(item["download_url"], destino)
         print(f"bajados {escrito} bytes")
@@ -282,36 +298,85 @@ def _archive_one(item: dict) -> int:
         # red que atrapa el fallo silencioso: si Telegram acepta la subida pero
         # despues no entrega el archivo, soltar R2 perderia el archivo para
         # siempre. `getFile` es la unica forma de saberlo sin bajarlo entero.
-        #
-        # Cuesta una llamada y salva el caso peor: archivar algo inaccesible.
         _verificar_bajada(item["bot_token"], fid, item["size"])
 
-        _call(
-            f"/{oid}/done",
-            {
-                "chat_id": item["chat_id"],
-                "message_id": resultado["result"]["message_id"],
-                "file_id": fid,
-                "bot_alias": item.get("bot_alias"),
-            },
-        )
-        print(f"archivado {oid}")
+        _reportar_archivado(item, message_id=resultado["result"]["message_id"], file_id=fid)
         return 0
     except (urllib.error.URLError, OSError, RuntimeError, KeyError) as exc:
-        # **El reclamo SIEMPRE se suelta.** Si el runner muere con el reclamo
-        # puesto, la fila se queda en `archiving` hasta que venza el lease, y
-        # mientras tanto nadie reintenta el archivo.
-        print(f"fallo archivando {oid}: {exc}", file=sys.stderr)
-        try:
-            _call(f"/{oid}/release", {"error": str(exc)[:500]})
-        except Exception as exc2:  # noqa: BLE001 - el release no puede tapar el fallo original
-            print(f"ademas fallo el release: {exc2}", file=sys.stderr)
+        _soltar(oid, exc)
         return 1
-    finally:
-        # El disco del runner es efimero, pero un archivo de 2 GB que se quede
-        # puede llenarlo y tumbar el siguiente objeto de la misma corrida.
-        if os.path.exists(destino):
-            os.unlink(destino)
+
+
+def _archive_via_mtproto(item: dict, destino: str) -> int:
+    """Camino de los grandes: mas de 20 MB, con la sesion de usuario.
+
+    **`bot_token` y `file_id` no aplican aqui.** El archivo lo sube la cuenta de
+    usuario, asi que no hay bot del pool que lo firme, y el `file_id` de MTProto
+    no es el de la Bot API: para recuperarlo hace falta la misma sesion y el
+    `message_id`. Se guardan los dos.
+    """
+    oid = item["id"]
+    print(f"archivo grande ({item['size']} bytes): se archiva por MTProto")
+
+    try:
+        escrito = _download(item["download_url"], destino)
+        print(f"bajados {escrito} bytes")
+
+        resultado = asyncio.run(
+            mtproto_upload.upload(destino, item["filename"], item["chat_id"])
+        )
+        print(f"subido por MTProto -> message_id={resultado['message_id']}")
+
+        # La misma red que en el camino de la Bot API: comprobar que se puede
+        # recuperar **antes** de soltar R2. Aqui importa mas todavia, porque un
+        # video de 1 GB es lo que mas duele perder.
+        asyncio.run(
+            mtproto_upload.verify_downloadable(
+                item["chat_id"], resultado["message_id"], item["size"]
+            )
+        )
+
+        _reportar_archivado(
+            item,
+            message_id=resultado["message_id"],
+            # Vacio a proposito: el `file_id` de MTProto no sirve por la Bot API,
+            # y guardar uno que no funciona seria peor que no guardar ninguno.
+            file_id=None,
+        )
+        return 0
+    except Exception as exc:  # noqa: BLE001 - Telethon lanza tipos variados
+        # Se atrapa ancho a proposito: Telethon lanza `RPCError`, `FloodWaitError`
+        # y errores de red propios, y enumerarlos todos dejaria escapar el que no
+        # se previo. Lo que importa es que **el reclamo se suelte siempre**: si
+        # se escapa, la fila queda en `archiving` hasta que venza el lease.
+        _soltar(oid, exc)
+        return 1
+
+
+def _reportar_archivado(item: dict, *, message_id: int, file_id: str | None) -> None:
+    """Le dice al backend que el objeto ya vive en Telegram."""
+    cuerpo = {
+        "chat_id": item["chat_id"],
+        "message_id": message_id,
+        "file_id": file_id,
+        "bot_alias": item.get("bot_alias"),
+    }
+    _call(f"/{item['id']}/done", cuerpo)
+    print(f"archivado {item['id']}")
+
+
+def _soltar(oid: str, exc: Exception) -> None:
+    """Suelta el reclamo con el motivo.
+
+    **Siempre se suelta, pase lo que pase.** Si el runner muere con el reclamo
+    puesto, la fila se queda en `archiving` hasta que venza el lease, y mientras
+    tanto nadie reintenta el archivo.
+    """
+    print(f"fallo archivando {oid}: {exc}", file=sys.stderr)
+    try:
+        _call(f"/{oid}/release", {"error": str(exc)[:500]})
+    except Exception as exc2:  # noqa: BLE001 - el release no puede tapar el fallo original
+        print(f"ademas fallo el release: {exc2}", file=sys.stderr)
 
 
 def main() -> int:

@@ -76,11 +76,50 @@ falla, el objeto se suelta en vez de marcarse archivado.
 Cuesta una llamada por archivo. Sin ella, un cambio de límite en Telegram
 significaría perder archivos en silencio.
 
-### Para archivos grandes de verdad
+## Archivos grandes: MTProto
 
-Habría que usar MTProto, que sube **y baja** hasta 2 GB. Necesita una sesión de
-usuario (`TG_USER_SESSION`), no un bot. Es otro trabajo, y el worker local ya lo
-hace.
+Los archivos de más de 20 MB van por MTProto (`mtproto_upload.py`), que sube
+**y baja** hasta 2 GB. No es una optimización: la Bot API no puede entregarlos,
+así que por ahí quedarían inaccesibles.
+
+| Camino | Tamaño | Quién sube |
+|---|---|---|
+| Bot API | hasta 20 MB | el bot del proyecto |
+| MTProto | hasta 2 GB | la cuenta de `TG_USER_SESSION` |
+| Ninguno | más de 2 GB | se queda en R2 |
+
+### Qué necesita MTProto
+
+Tres secretos más en Infisical, que ya existen para el worker local:
+
+| Variable | Qué es |
+|---|---|
+| `TG_API_ID` | De my.telegram.org |
+| `TG_API_HASH` | De my.telegram.org |
+| `TG_USER_SESSION` | `StringSession` de una cuenta de usuario |
+
+**El `file_id` no se guarda en el camino MTProto.** El de MTProto no sirve por la
+Bot API, y guardar uno que no funciona sería peor que no guardar ninguno: para
+recuperar esos archivos hacen falta la misma sesión y el `message_id`.
+
+### El usuario tiene que ser miembro del canal
+
+Un bot no puede subir archivos grandes: los bots están limitados a la Bot API.
+Por eso hace falta una cuenta de usuario, y **esa cuenta tiene que ser miembro
+del canal con permiso de publicar**.
+
+Sin acceso, Telethon responde `Could not find the input entity`. No es un
+problema de caché: se comprobó pidiendo el canal directamente a Telegram por su
+id, y también falla.
+
+Agregar la cuenta del `TG_USER_SESSION` como administrador del canal, con
+permiso de publicar mensajes.
+
+### Consecuencia: la autoría cambia
+
+Los archivos subidos por MTProto aparecen en Telegram como **enviados por la
+cuenta de usuario**, no por el bot. En el mismo canal conviven los dos autores
+según el tamaño del archivo.
 
 ## Secretos
 

@@ -58,6 +58,11 @@ jobs:
           # espera `infisical`: devuelve 401 "OIDC audience not allowed" sin
           # decir cual de las dos cosas estaba mal.
 
+      - name: Instalar dependencias
+        # Solo Telethon: el resto del script usa la libreria estandar. La Bot API
+        # se llama a mano con `urllib`, asi que no hace falta `httpx` ni `requests`.
+        run: pip install --quiet telethon
+
       - name: Archivar
         env:
           # **`secrets`, no `vars`.** El valor esta dado de alta como secreto en
@@ -71,6 +76,12 @@ jobs:
           # con las dos, asi que se lee de ahi.
           BACKEND_URL: ${{ secrets.BACKEND_URL }}
           WORKER_TOKEN: ${{ env.WORKER_TOKEN }}
+          # MTProto, para los archivos que la Bot API no puede entregar (mas de
+          # 20 MB). **Es una sesion de usuario, no un bot**: los bots estan
+          # limitados a la Bot API y no pueden subir archivos grandes.
+          TG_API_ID: ${{ env.TG_API_ID }}
+          TG_API_HASH: ${{ env.TG_API_HASH }}
+          TG_USER_SESSION: ${{ env.TG_USER_SESSION }}
           # **El token del bot y su canal no van aqui.** Los entrega el endpoint
           # `/claim`, resueltos desde la base del backend, que es donde vive el
           # bot. Tenerlos tambien aqui seria una segunda fuente de verdad.
