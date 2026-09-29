@@ -55,13 +55,12 @@ jobs:
       - name: Instalar dependencias
         # ffmpeg ya viene en el runner; esto es lo que no trae Python.
         #
-        # **`boto3` y no `aioboto3`.** Este script es sincrono de punta a punta
-        # -`urllib`, ffmpeg por subprocess, PIL-, asi que la version async solo
-        # agregaria un event loop para nada. El backend usa `aioboto3` porque el
-        # es async; aqui no hace falta.
+        # **`boto3` y no `aioboto3`.** La subida a R2 es lo unico sincrono de
+        # este script; Telethon ya trae su propio bucle. Meter `aioboto3`
+        # agregaria un segundo event loop para una sola llamada.
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          pip install --quiet pillow httpx boto3
+          pip install --quiet pillow httpx boto3 telethon
 
       - name: Generar miniaturas pendientes
         env:
@@ -71,4 +70,14 @@ jobs:
           R2_BUCKET: ${{ env.R2_BUCKET }}
           R2_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          # **Una sesion PROPIA, no la del servidor.** Una sesion de Telegram no
+          # admite dos IPs a la vez: compartir la de Render hace que Telegram la
+          # mate con `AuthKeyDuplicatedError` y **el servidor se queda sin
+          # sesion**. Este job corre desde la IP de GitHub, distinta cada vez.
+          #
+          # La misma cuenta puede tener varias sesiones si cada una tiene su
+          # clave; se genera con `scripts/userbot_login.py`.
+          CRON_TG_SESSION: ${{ env.CRON_TG_SESSION }}
+          TG_API_ID: ${{ env.TG_API_ID }}
+          TG_API_HASH: ${{ env.TG_API_HASH }}
         run: python thumbnails.py

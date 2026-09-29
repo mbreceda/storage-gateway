@@ -11,22 +11,34 @@ es la red: pide los pendientes al backend y los procesa.
 
 Que hace, por archivo
 ---------------------
-1. Pide al backend los primeros MB del video (`Range`, no el archivo entero).
-   Un frame del segundo 1 vive en la cabecera: bajar 2 GB para quedarse con 5 MB
-   es justo lo que la cache en R2 existe para evitar.
+1. Baja **el inicio** del video de Telegram por MTProto.
 2. Saca un frame con ffmpeg, del segundo 1 y si falla del 0.
 3. Lo redimensiona con PIL y lo sube a `thumbs/<uuid>.jpg`.
 4. Avisa al backend, que cuenta los bytes y marca el archivo.
 
-**No usa el worker ni la base.** El backend expone lo que hace falta por HTTP,
-asi que este script no comparte codigo con el repo del servidor: es un runner
-que sabe hablar los dos protocolos -HTTP y S3-.
+Por que MTProto y no el backend
+-------------------------------
+El worker de casa baja por un Bot API local que resuelve el `file_id` sin el
+tope de 20 MB del publico. **Un runner de GitHub no tiene eso.** La alternativa
+seria bajar por el backend, con 0.1 CPU en medio: 25 MB por video, que es justo
+lo que el trabajo de miniaturas existe para evitar.
 
-Por que no toca los fragmentados
---------------------------------
-Un archivo partido en trozos de 512 MB no se puede muestrear con un `Range` de
-los primeros megabytes: el primer trozo no contiene la cabecera del video
-completo. El backend ya los excluye de la lista.
+Por que una SESION PROPIA y no la del servidor
+----------------------------------------------
+**Una sesion de Telegram no admite dos IPs a la vez.** Comprobado: usar la misma
+clave desde Render y desde local hace que Telegram la mate con
+`AuthKeyDuplicatedError`, y **el servidor se queda sin sesion**.
+
+Este cron corre en la IP de GitHub, distinta cada vez. Por eso usa
+`CRON_TG_SESSION`, una sesion propia: la misma cuenta puede tener varias si cada
+una tiene su clave -la cuenta ya tenia tres activas-.
+
+Por que no baja el video entero
+-------------------------------
+Un frame del segundo 1 vive en la cabecera. Se piden los primeros MB y se corta:
+bajar 2 GB para quedarse con un frame es lo que la cache en R2 existe para
+evitar. Los videos cuyo indice esta al final no se pueden muestrear asi, y se
+marcan como descartados para no reintentarlos cada media hora.
 """
 
 import io
@@ -95,21 +107,53 @@ def _pendientes(limite: int) -> list[dict]:
         ) from exc
 
 
-def _bajar_inicio(uuid: str, largo: int, destino: str) -> int:
-    """Baja los primeros `largo` bytes del video. Devuelve los bytes escritos.
+def _bajar_inicio(item: dict, largo: int, destino: str) -> int:
+    """Baja los primeros `largo` bytes del video, directo de Telegram. MTProto.
 
-    **`Range`, no el archivo entero.** El backend lo soporta, y sin el esta
-    funcion bajaria 2 GB para sacar un frame de la cabecera.
+    **Se corta al llegar al largo.** Un frame del segundo 1 vive en la cabecera:
+    bajarlo entero serian 2 GB para quedarse con 50 KB. Telethon no sabe "dame
+    solo el principio", asi que la economia esta en **dejar de escribir y salir**,
+    no en pedir menos.
     """
-    url = f"{BACKEND}/jobs/worker/files/{uuid}/download"
-    req = urllib.request.Request(url, headers={**_headers(), "Range": f"bytes=0-{largo - 1}"})
-    with urllib.request.urlopen(req, timeout=300) as r, open(destino, "wb") as fh:
-        while True:
-            trozo = r.read(1024 * 1024)
-            if not trozo:
-                break
-            fh.write(trozo)
-    return os.path.getsize(destino)
+    import asyncio
+
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    chat_id, message_id = item.get("chat_id"), item.get("message_id")
+    if not chat_id or not message_id:
+        raise RuntimeError(
+            "el archivo no tiene chat_id/message_id: no se puede bajar por MTProto"
+        )
+
+    escrito = 0
+
+    async def _bajar():
+        nonlocal escrito
+        cliente = TelegramClient(
+            StringSession(os.environ["CRON_TG_SESSION"]),
+            int(os.environ["TG_API_ID"]),
+            os.environ["TG_API_HASH"],
+        )
+        await cliente.connect()
+        try:
+            if not await cliente.is_user_authorized():
+                raise RuntimeError("CRON_TG_SESSION no esta autorizada")
+            entidad = await cliente.get_entity(int(chat_id))
+            mensaje = await cliente.get_messages(entidad, ids=int(message_id))
+            if mensaje is None or not mensaje.file:
+                raise RuntimeError(f"el mensaje {message_id} no tiene archivo")
+            with open(destino, "wb") as fh:
+                async for trozo in cliente.iter_download(mensaje, request_size=1024 * 1024):
+                    fh.write(trozo)
+                    escrito += len(trozo)
+                    if escrito >= largo:
+                        break
+        finally:
+            await cliente.disconnect()
+
+    asyncio.run(_bajar())
+    return escrito
 
 
 def _frame(src: str) -> str | None:
@@ -185,7 +229,7 @@ def _una(item: dict) -> bool:
         frame = None
         try:
             largo = min(mb * 1024 * 1024, tam) if tam else mb * 1024 * 1024
-            escrito = _bajar_inicio(uuid, largo, src)
+            _bajar_inicio(item, largo, src)
             frame = _frame(src)
             if not frame:
                 continue  # Se reintenta con mas bytes: `moov` puede estar al final.
@@ -201,7 +245,27 @@ def _una(item: dict) -> bool:
                 if ruta and os.path.exists(ruta):
                     os.unlink(ruta)
 
-    print("    no se pudo sacar un frame con ningun tamano", file=sys.stderr)
+    # **Se avisa al backend para no reintentarlo para siempre.** Sin esto, el
+    # video vuelve en cada corrida: el cron baja 25 MB, falla, y empieza de nuevo
+    # en 30 minutos. Con unos pocos asi, el cron se convierte en un bucle que
+    # gasta ancho de banda sin avanzar nunca.
+    #
+    # **Se dice que se intento y con cuanto.** Este mensaje es lo que distingue
+    # "el indice esta al final" de "ffmpeg esta roto": sin los tamanos probados,
+    # los dos casos se ven igual y ninguno se puede diagnosticar.
+    probados = ", ".join(f"{mb} MB" for mb in INTENTOS_MB)
+    motivo = (
+        f"sin frame con {probados}; probablemente el indice esta al final "
+        f"y no se puede muestrear sin bajarlo entero ({tam // (1024 * 1024)} MB)"
+    )
+    print(f"    {motivo}", file=sys.stderr)
+    try:
+        httpx.post(
+            f"{BACKEND}/jobs/worker/files/{uuid}/thumbnail-failed",
+            headers=_headers(), json={"error": motivo}, timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001 - no poder avisar no cambia el resultado
+        print(f"    (no se pudo marcar como descartada: {exc})", file=sys.stderr)
     return False
 
 
@@ -218,9 +282,18 @@ def main() -> int:
             hechas += 1
 
     print(f"\n{hechas} de {len(pendientes)} listas")
-    # **Sale 0 aunque fallen algunas.** Un video corrupto no debe marcar la
-    # corrida como roja: el cron vuelve en 30 minutos y reintenta el resto. Un
-    # fallo duro -token malo, backend caido- ya lanzo excepcion antes.
+
+    # **Fallar en TODAS es un fallo sistemico, y debe verse rojo.** Un video
+    # corrupto no debe marcar la corrida: el cron vuelve en 30 minutos. Pero si
+    # fallan las 50, algo esta roto -ffmpeg sin instalar, R2 sin permisos- y una
+    # corrida verde lo esconderria: se ve igual que "no habia nada que hacer".
+    if pendientes and hechas == 0:
+        print(
+            f"FALLO: ninguna de las {len(pendientes)} miniaturas se pudo generar. "
+            "Con una sola seria un archivo raro; con todas, algo esta roto.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
