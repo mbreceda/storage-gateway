@@ -1,0 +1,70 @@
+name: archive
+
+# Archiva en Telegram lo que los proyectos subieron a R2.
+#
+# Se dispara de dos formas, y la segunda es la red de seguridad:
+#   1. `repository_dispatch` desde el backend, justo despues de un `complete`.
+#      Es el camino normal: el objeto se archiva en minutos.
+#   2. `schedule` cada 30 minutos, por si el dispatch no llega -el backend
+#      estaba dormido, GitHub lo perdio, nadie lo disparo-.
+#
+# **El cron va cada 30 min y no cada 15.** GitHub da 2000 minutos al mes en
+# repo privado; este repo es publico y no gasta cuota, pero un cron agresivo
+# sigue siendo ruido y runners despertando para no encontrar nada. Con 30 min
+# son 48 corridas al dia; la mayoria terminan en segundos.
+on:
+  repository_dispatch:
+    types: [archive]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+# OIDC necesita `id-token: write`. Sin esto el action de Infisical no puede
+# pedir el token y falla con un 401 que no explica por que.
+permissions:
+  id-token: write
+  contents: read
+
+# Dos corridas a la vez no se pisan -el backend reclama con un UPDATE
+# condicional-, pero si una se cuelga no queremos que se acumulen.
+concurrency:
+  group: archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    # Por debajo del tope de 6 h de GitHub. Un archivo de 2 GB por un enlace
+    # lento tarda, pero no tanto: si llega aqui, algo se colgo.
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Leer secretos de Infisical (OIDC)
+        uses: Infisical/secrets-action@v1.0.9
+        with:
+          method: oidc
+          identity-id: 7a11e24f-b33c-4c4c-a83d-7b1d75cb80c9
+          project-slug: tgm-media-server-m1-kc
+          env-slug: dev
+          oidc-audience: infisical
+          # **Sin `oidc-audience` el action pide un token con la audiencia por
+          # defecto (`https://github.com/<owner>`), y la identidad de Infisical
+          # espera `infisical`: devuelve 401 "OIDC audience not allowed" sin
+          # decir cual de las dos cosas estaba mal.
+
+      - name: Archivar
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+          WORKER_TOKEN: ${{ env.WORKER_TOKEN }}
+          # El bot con el que se sube. **Su `file_id` solo sirve con el**:
+          # cambiarlo despues deja los archivos ya archivados sin poder leerse.
+          ARCHIVE_BOT_TOKEN: ${{ env.ARCHIVE_BOT_TOKEN }}
+          ARCHIVE_CHAT_ID: ${{ env.ARCHIVE_CHAT_ID }}
+          ARCHIVE_BOT_ALIAS: ${{ env.ARCHIVE_BOT_ALIAS }}
+        run: python archive.py
