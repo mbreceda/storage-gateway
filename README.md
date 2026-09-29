@@ -82,11 +82,16 @@ Los archivos de más de 20 MB van por MTProto (`mtproto_upload.py`), que sube
 **y baja** hasta 2 GB. No es una optimización: la Bot API no puede entregarlos,
 así que por ahí quedarían inaccesibles.
 
-| Camino | Tamaño | Quién sube |
-|---|---|---|
-| Bot API | hasta 20 MB | el bot del proyecto |
-| MTProto | hasta 2 GB | la cuenta de `TG_USER_SESSION` |
-| Ninguno | más de 2 GB | se queda en R2 |
+| Camino | Tamaño | Quién sube | Dónde |
+|---|---|---|---|
+| Bot API | hasta 20 MB | el bot del proyecto | canal del bot (`storage-07`) |
+| MTProto | hasta 2 GB | la cuenta de `TG_USER_SESSION` | canal principal (`base`) |
+| Ninguno | más de 2 GB | — | se queda en R2 |
+
+**Los dos caminos tienen destinos distintos, y no es una elección.** La cuenta
+de usuario no es miembro del canal del bot, y sin acceso Telethon responde
+`Could not find the input entity`. El backend entrega los dos canales en
+`chat_id` y `big_chat_id`, y el archivador elige según el tamaño.
 
 ### Qué necesita MTProto
 
@@ -102,7 +107,7 @@ Tres secretos más en Infisical, que ya existen para el worker local:
 Bot API, y guardar uno que no funciona sería peor que no guardar ninguno: para
 recuperar esos archivos hacen falta la misma sesión y el `message_id`.
 
-### El usuario tiene que ser miembro del canal
+### El usuario tiene que ser miembro del canal donde publica
 
 Un bot no puede subir archivos grandes: los bots están limitados a la Bot API.
 Por eso hace falta una cuenta de usuario, y **esa cuenta tiene que ser miembro
@@ -112,14 +117,33 @@ Sin acceso, Telethon responde `Could not find the input entity`. No es un
 problema de caché: se comprobó pidiendo el canal directamente a Telegram por su
 id, y también falla.
 
-Agregar la cuenta del `TG_USER_SESSION` como administrador del canal, con
-permiso de publicar mensajes.
+La cuenta actual es **creadora** del canal principal, así que los grandes van
+ahí. Si algún día se quiere otro destino, la cuenta tiene que ser miembro
+primero.
 
 ### Consecuencia: la autoría cambia
 
 Los archivos subidos por MTProto aparecen en Telegram como **enviados por la
-cuenta de usuario**, no por el bot. En el mismo canal conviven los dos autores
-según el tamaño del archivo.
+cuenta de usuario**, no por el bot.
+
+Como además van a canales distintos, al final hay dos sitios:
+
+- **canal del bot** (`storage-07`): los archivos de hasta 20 MB.
+- **canal principal** (`base`): los de más de 20 MB.
+
+### El nombre del archivo
+
+**`file_name` no basta y Telethon lo ignora.** Comprobado con 30 MB reales: el
+archivo llegaba a Telegram con el nombre del temporal (`tmpjas2ksvo.bin`).
+
+Se probaron tres formas, y solo una funciona:
+
+| Forma | Resultado |
+|---|---|
+| `file_name="x.mp4"` | ignorado |
+| `file=handle_abierto` | ignorado |
+| `file=(ruta, "x.mp4")` | `ValueError` |
+| `attributes=[DocumentAttributeFilename("x.mp4")]` | **correcto** |
 
 ## Secretos
 
@@ -225,5 +249,7 @@ Telegram rechazando, cola vacía, y sin bot.
 | `chat not found` | El bot no es miembro del canal, o falta el prefijo `-100` |
 | `el backend no entrego bot para el alias` | El alias no existe en el pool, no tiene canal, o cambió `SECRET_KEY` |
 | `file is too big` en `getFile` | El archivo pasa de 20 MB: no se puede bajar |
+| `Could not find the input entity` | La cuenta del usuario no es miembro del canal destino |
+| El archivo aparece como `tmpXXXX.bin` | Falta el `DocumentAttributeFilename` |
 | `Request Entity Too Large` | El archivo pasa de 50 MB y llegó a Telegram |
 | Nada se archiva y el log dice "nada que archivar" | Los objetos están en `pending`: nunca se llamó a `/complete` |
