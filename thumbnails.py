@@ -171,18 +171,34 @@ def _bajar_bot_api(item: dict, destino: str) -> int:
     **El `file_id` solo sirve con el bot que subio el archivo**, y el backend
     entrega su token resuelto por canal en `bot_token`.
     """
-    token = item.get("bot_token")
     file_id = item.get("file_id")
-    if not token or not file_id:
-        raise RuntimeError("sin bot_token o file_id: no se puede usar la Bot API")
+    if not file_id:
+        raise RuntimeError("sin file_id: la Bot API no puede resolver el archivo")
 
-    info = urllib.request.urlopen(
-        f"https://api.telegram.org/bot{token}/getFile?file_id={urllib.parse.quote(file_id)}",
-        timeout=60,
-    )
-    datos = json.loads(info.read())
-    if not datos.get("ok"):
-        raise RuntimeError(f"getFile fallo: {datos.get('description')}")
+    # **Se prueba el token del canal y, si no hay, todos los bots activos.** Un
+    # `file_id` solo responde con el bot que subio el archivo, y las 119 filas
+    # sin canal no dicen cual fue. El que no sirve contesta `wrong file_id`.
+    candidatos = [item["bot_token"]] if item.get("bot_token") else item.get("bot_candidates") or []
+    if not candidatos:
+        raise RuntimeError("sin bot_token ni candidatos: no se puede usar la Bot API")
+
+    token = None
+    ultimo = ""
+    for cand in candidatos:
+        try:
+            info = urllib.request.urlopen(
+                f"https://api.telegram.org/bot{cand}/getFile?file_id={urllib.parse.quote(file_id)}",
+                timeout=60,
+            )
+            datos = json.loads(info.read())
+            if datos.get("ok"):
+                token = cand
+                break
+            ultimo = str(datos.get("description") or "")[:80]
+        except urllib.error.HTTPError as exc:
+            ultimo = str(json.loads(exc.read()).get("description") or "")[:80]
+    if token is None:
+        raise RuntimeError(f"ningun bot pudo resolver el file_id ({ultimo})")
 
     ruta_remota = datos["result"]["file_path"]
     with urllib.request.urlopen(
@@ -279,12 +295,16 @@ def _una(item: dict) -> bool:
                 print(f"    ok por Bot API, {len(jpeg)} bytes")
                 return True
         except Exception as exc:  # noqa: BLE001 - se reporta y se descarta
-            print(f"    fallo por Bot API: {type(exc).__name__}: {str(exc)[:140]}", file=sys.stderr)
+            motivo = f"{type(exc).__name__}: {str(exc)[:140]}"
+            print(f"    fallo por Bot API: {motivo}", file=sys.stderr)
+            _descartar(uuid, tam, f"la Bot API no pudo ({motivo})")
+            return False
         finally:
             for ruta in (src, frame):
                 if ruta and os.path.exists(ruta):
                     os.unlink(ruta)
-        _descartar(uuid, tam, "la Bot API tampoco pudo: puede pasar de 20 MB o el file_id no sirve")
+        # Se llego aqui sin frame y sin excepcion: el archivo no dio imagen.
+        _descartar(uuid, tam, "la Bot API bajo el archivo pero no dio frame")
         return False
 
     for mb in INTENTOS_MB:
@@ -382,8 +402,10 @@ def _canales_visibles(pendientes: list[dict]) -> None:
 
     for item in pendientes:
         canal = item.get("chat_id")
-        if canal and not visibles.get(canal, False):
-            # MTProto no puede: se marca para que vaya por la Bot API de entrada.
+        # **Sin canal tambien va por la Bot API.** MTProto necesita
+        # `chat_id` + `message_id` para pedir el mensaje; sin canal no puede,
+        # aunque tenga `file_id`.
+        if not canal or not visibles.get(canal, False):
             item["sin_mtproto"] = True
 
     ciegos = sum(1 for i in pendientes if i.get("sin_mtproto"))
