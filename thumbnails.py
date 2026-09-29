@@ -81,6 +81,16 @@ if not BACKEND.startswith("http"):
     sys.exit(1)
 
 
+class _SinCamino(Exception):
+    """Un fallo del que no hay salida: reintentarlo no cambia nada.
+
+    Se distingue de un fallo transitorio -un bot caido, un backend sin
+    desplegar- porque el descarte es permanente. Confundirlos deja archivos sin
+    miniatura para siempre, o hace que el cron reintente 40 archivos cada 30
+    minutos sin poder avanzar.
+    """
+
+
 def _limpiar(exc: Exception) -> str:
     """El mensaje de error sin el nombre del archivo.
 
@@ -144,9 +154,10 @@ def _bajar_inicio(item: dict, largo: int, destino: str) -> int:
 
     chat_id, message_id = item.get("chat_id"), item.get("message_id")
     if not chat_id or not message_id:
-        raise RuntimeError(
-            "el archivo no tiene chat_id/message_id: no se puede bajar por MTProto"
-        )
+        # **Tambien es un sin camino.** MTProto necesita el canal y el mensaje
+        # para pedirle el archivo a Telegram; sin ellos no hay nada que
+        # reintentar.
+        raise _SinCamino("sin chat_id/message_id y MTProto no ve el canal")
 
     escrito = 0
 
@@ -195,7 +206,11 @@ def _bajar_bot_api(item: dict, destino: str) -> int:
     """
     file_id = item.get("file_id")
     if not file_id:
-        raise RuntimeError("sin file_id: la Bot API no puede resolver el archivo")
+        # **Sin `file_id` no hay camino, y es definitivo.** La Bot API necesita
+        # ese identificador y MTProto necesita el canal: si falta, y la sesion no
+        # ve el canal, no hay nada que reintentar. Marcarlo como transitorio
+        # hacia que 40 archivos volvieran en cada corrida sin poder avanzar.
+        raise _SinCamino("sin file_id y MTProto no ve el canal: ningun camino alcanza")
 
     # **Se prueba el token del canal y, si no hay, todos los bots activos.** Un
     # `file_id` solo responde con el bot que subio el archivo, y las 119 filas
@@ -318,6 +333,10 @@ def _una(item: dict) -> bool:
                 _subir(uuid, jpeg)
                 print(f"    ok por Bot API, {len(jpeg)} bytes")
                 return True
+        except _SinCamino as exc:
+            print(f"    sin camino: {exc}", file=sys.stderr)
+            _descartar(uuid, tam, str(exc))
+            return False
         except Exception as exc:  # noqa: BLE001 - se reporta; puede ser transitorio
             motivo = f"{type(exc).__name__}: {_limpiar(exc)}"
             print(f"    fallo por Bot API: {motivo}", file=sys.stderr)
@@ -348,7 +367,12 @@ def _una(item: dict) -> bool:
         frame = None
         try:
             largo = min(mb * 1024 * 1024, tam) if tam else mb * 1024 * 1024
-            _bajar_inicio(item, largo, src)
+            try:
+                _bajar_inicio(item, largo, src)
+            except _SinCamino as exc:
+                print(f"    sin camino: {exc}", file=sys.stderr)
+                _descartar(uuid, tam, str(exc))
+                return False
             frame = _frame(src)
             if not frame:
                 continue  # Se reintenta con mas bytes: `moov` puede estar al final.
