@@ -58,9 +58,13 @@ Todo viene de Infisical por OIDC. **Nada vive en GitHub.**
 | Variable | Qué es |
 |---|---|
 | `WORKER_TOKEN` | El mismo del backend. Autentica las llamadas de coordinación |
-| `ARCHIVE_BOT_TOKEN` | Token del bot que sube |
-| `ARCHIVE_CHAT_ID` | Canal **de ese bot**, donde publica |
-| `ARCHIVE_BOT_ALIAS` | Alias del bot en el pool (`bot-07`) |
+
+**El token del bot y su canal no son variables.** Los entrega `/claim`, resueltos
+desde la base del backend: `bot_token` y `chat_id`.
+
+Duplicarlos en Infisical crearía dos fuentes de verdad. Rotar el bot en la base
+no rotaría la copia, y el fallo aparecería como `chat not found` —que suena a
+permisos— en vez de como lo que es.
 
 Y una **variable de repo** en GitHub, no un secreto:
 
@@ -68,14 +72,34 @@ Y una **variable de repo** en GitHub, no un secreto:
 |---|---|
 | `BACKEND_URL` | La URL del backend en Render |
 
+### Cómo se elige el bot
+
+El backend resuelve el bot así:
+
+1. El token del proyecto (`storage_tokens.bot_alias`), si tiene uno.
+2. Si no, el `bot_alias` del propio objeto.
+3. Con ese alias busca en `bots` y descifra `token_encrypted`.
+
+Sale del pool existente. **No hay que crear nada en BotFather.**
+
+Estado verificado: `bot-07` → `@store_cool_agent_6_bot`, canal `storage-07`,
+administrador con permiso de publicar.
+
+Si el backend no logra resolver el bot —el alias no existe, no tiene canal, o
+`SECRET_KEY` cambió y el token guardado ya no se descifra— `/claim` devuelve
+`bot_token: null`. El archivador entonces **suelta el objeto** en vez de
+intentar subir, y dice cuáles son los tres motivos posibles.
+
 ### El canal tiene que ser el del bot
 
-`ARCHIVE_CHAT_ID` **no es `TG_FILES_CHAT`**. El bot tiene que ser miembro de ese
-canal con permiso para publicar. Con el canal de otro bot, Telegram contesta
-`Bad Request: chat not found` aunque el canal exista.
+En la base el canal vive como lo devuelve MTProto -`4059354648`- y la Bot API
+contesta `chat not found` con esa forma: necesita `-1004059354648`. El backend
+hace la conversión y entrega el id ya listo.
 
-Y el `file_id` **solo sirve con el bot que subió el archivo**. Cambiar
-`ARCHIVE_BOT_TOKEN` después deja los archivos ya archivados sin poder leerse.
+El bot tiene que ser miembro de ese canal con permiso para publicar.
+
+Y el `file_id` **solo sirve con el bot que subió el archivo**. Cambiar el bot de
+un proyecto después deja los archivos ya archivados sin poder leerse.
 
 ## Cuándo corre
 
@@ -128,6 +152,7 @@ Telegram rechazando, y cola vacía.
 | Síntoma | Causa |
 |---|---|
 | `401 OIDC audience not allowed` | Falta `oidc-audience: infisical` en el action |
-| `chat not found` | El bot no es miembro del canal, o es el canal de otro bot |
+| `chat not found` | El bot no es miembro del canal, o falta el prefijo `-100` |
+| `el backend no entrego bot para el alias` | El alias no existe en el pool, no tiene canal, o cambió `SECRET_KEY` |
 | `Request Entity Too Large` | El archivo pasa de 50 MB y llegó a Telegram |
 | Nada se archiva y el log dice "nada que archivar" | Los objetos están en `pending`: nunca se llamó a `/complete` |

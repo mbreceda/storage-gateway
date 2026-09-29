@@ -42,9 +42,11 @@ srv = HTTPServer(("127.0.0.1", 0), H)
 port = srv.server_address[1]
 COLA.extend([
     {"id": "so_grande", "project": "p", "filename": "grande.mp4", "size": 60*1024*1024,
-     "content_type": None, "r2_key": "k", "download_url": f"http://127.0.0.1:{port}/big", "bot_alias": None},
+     "content_type": None, "r2_key": "k", "download_url": f"http://127.0.0.1:{port}/big", "bot_alias": "bot-07",
+     "bot_token": "btok", "chat_id": "-100999"},
     {"id": "so_chico", "project": "p", "filename": "chico.txt", "size": 11,
-     "content_type": None, "r2_key": "k", "download_url": f"http://127.0.0.1:{port}/small", "bot_alias": None},
+     "content_type": None, "r2_key": "k", "download_url": f"http://127.0.0.1:{port}/small", "bot_alias": "bot-07",
+     "bot_token": "btok", "chat_id": "-100999"},
 ])
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -65,16 +67,13 @@ threading.Thread(target=tsrv.serve_forever, daemon=True).start()
 os.environ.update({
     "BACKEND_URL": f"http://127.0.0.1:{port}",
     "WORKER_TOKEN": "wtok",
-    "ARCHIVE_BOT_TOKEN": "btok",
-    "ARCHIVE_CHAT_ID": "-100999",
-    "ARCHIVE_BOT_ALIAS": "bot-07",
     "GITHUB_RUN_ID": "run-1",
 })
 import archive
 archive.COLA = COLA
 # Redirigir la subida a Telegram al servidor falso
 real_upload = archive._upload
-def fake_upload(ruta, filename):
+def fake_upload(ruta, filename, bot_token, chat_id):
     import urllib.request
     req = urllib.request.Request(f"http://127.0.0.1:{tport}/sendDocument", data=b"x", method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
@@ -83,6 +82,22 @@ archive._upload = fake_upload
 
 codigo = archive.main()
 print("\n--- resultado ---")
+# --- Caso: el backend no entrega bot ----------------------------------------
+# Sin token ni canal, el archivador debe soltar el objeto en vez de intentar
+# subir. Es lo que pasa si el alias no existe en el pool, si no tiene canal, o
+# si SECRET_KEY cambio y el token guardado ya no se descifra.
+LLAMADAS.clear()
+COLA.append({"id": "so_sin_bot", "project": "p", "filename": "x.txt", "size": 5,
+             "content_type": None, "r2_key": "k",
+             "download_url": f"http://127.0.0.1:{port}/small", "bot_alias": "bot-99",
+             "bot_token": None, "chat_id": None})
+codigo = archive.main()
+print("\n--- sin bot ---")
 print("codigo de salida:", codigo)
+assert codigo == 1, "sin bot debe salir 1"
+assert any("release" in p for p, _, _ in LLAMADAS), "debe soltar el reclamo"
+assert not any("done" in p for p, _, _ in LLAMADAS), "no debe marcarlo archivado"
+print("OK: sin bot suelta el reclamo y no lo archiva")
+
 for path, body, tok in LLAMADAS:
     print(f"  {path} token={tok} {json.dumps(body)[:110]}")

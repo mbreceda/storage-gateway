@@ -62,9 +62,7 @@ jobs:
         env:
           BACKEND_URL: ${{ vars.BACKEND_URL }}
           WORKER_TOKEN: ${{ env.WORKER_TOKEN }}
-          # El bot con el que se sube. **Su `file_id` solo sirve con el**:
-          # cambiarlo despues deja los archivos ya archivados sin poder leerse.
-          ARCHIVE_BOT_TOKEN: ${{ env.ARCHIVE_BOT_TOKEN }}
-          ARCHIVE_CHAT_ID: ${{ env.ARCHIVE_CHAT_ID }}
-          ARCHIVE_BOT_ALIAS: ${{ env.ARCHIVE_BOT_ALIAS }}
+          # **El token del bot y su canal no van aqui.** Los entrega el endpoint
+          # `/claim`, resueltos desde la base del backend, que es donde vive el
+          # bot. Tenerlos tambien aqui seria una segunda fuente de verdad.
         run: python archive.py

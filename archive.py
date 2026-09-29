@@ -35,12 +35,11 @@ import urllib.request
 
 BACKEND = os.environ["BACKEND_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
-BOT_TOKEN = os.environ["ARCHIVE_BOT_TOKEN"]
-# El canal **del bot**, no el del servidor. El bot tiene que ser miembro con
-# permiso de publicar ahi: con `TG_FILES_CHAT` el archivado falla con "chat not
-# found" aunque el chat exista, porque ese canal es de otro bot.
-CHAT_ID = os.environ["ARCHIVE_CHAT_ID"]
-BOT_ALIAS = os.environ.get("ARCHIVE_BOT_ALIAS") or None
+
+# **El token del bot y su canal NO viven aqui.** Los entrega `/claim`, resueltos
+# desde la base del backend. Duplicarlos en Infisical crearia dos fuentes de
+# verdad: rotar una no rotaria la otra, y el fallo apareceria como
+# `chat not found` sin pista del motivo.
 
 # Tope de la Bot API para `sendDocument`. **No es configurable**: si se sube, el
 # script empieza a trocear y deja objetos partidos en Telegram.
@@ -95,8 +94,11 @@ def _download(url: str, destino: str) -> int:
     return total
 
 
-def _upload(ruta: str, filename: str) -> dict:
+def _upload(ruta: str, filename: str, bot_token: str, chat_id: str) -> dict:
     """Sube a Telegram con `sendDocument`. Devuelve la respuesta de Telegram.
+
+    El token y el canal vienen de `/claim`, no del entorno: el backend los
+    resuelve desde su base, que es donde vive el bot.
 
     Se usa `sendDocument` y no `sendVideo` aunque sea un video: Telegram solo
     previsualiza los formatos que conoce, y con `sendVideo` un archivo que no
@@ -108,7 +110,7 @@ def _upload(ruta: str, filename: str) -> dict:
         contenido = fh.read()
 
     cuerpo = b""
-    for nombre, valor in (("chat_id", CHAT_ID), ("caption", filename)):
+    for nombre, valor in (("chat_id", chat_id), ("caption", filename)):
         cuerpo += (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{nombre}"\r\n\r\n'
@@ -122,7 +124,7 @@ def _upload(ruta: str, filename: str) -> dict:
     cuerpo += contenido + f"\r\n--{boundary}--\r\n".encode()
 
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+        f"https://api.telegram.org/bot{bot_token}/sendDocument",
         data=cuerpo,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST",
@@ -163,12 +165,27 @@ def _archive_one(item: dict) -> int:
         _call(f"/{oid}/release", {"error": "el backend no pudo firmar la bajada"})
         return 1
 
+    # **Sin bot no se puede subir, y se dice por que.** Los tres motivos posibles
+    # -el proyecto no tiene alias, el alias no existe en el pool, o `SECRET_KEY`
+    # cambio y el token guardado ya no se descifra- dan el mismo `None` aqui. El
+    # mensaje los enumera en vez de elegir uno, porque desde el runner no se
+    # pueden distinguir y adivinar mal cuesta una tarde.
+    if not item.get("bot_token") or not item.get("chat_id"):
+        motivo = (
+            f"el backend no entrego bot para el alias {item.get('bot_alias')!r}: "
+            "revisa que el alias exista en el pool y tenga canal, y que SECRET_KEY "
+            "no haya cambiado"
+        )
+        print(motivo, file=sys.stderr)
+        _call(f"/{oid}/release", {"error": motivo})
+        return 1
+
     destino = f"/tmp/{oid}_{item['filename']}"
     try:
         escrito = _download(item["download_url"], destino)
         print(f"bajados {escrito} bytes")
 
-        resultado = _upload(destino, item["filename"])
+        resultado = _upload(destino, item["filename"], item["bot_token"], item["chat_id"])
         if not resultado.get("ok"):
             raise RuntimeError(f"Telegram rechazo la subida: {resultado}")
 
@@ -179,10 +196,10 @@ def _archive_one(item: dict) -> int:
         _call(
             f"/{oid}/done",
             {
-                "chat_id": CHAT_ID,
+                "chat_id": item["chat_id"],
                 "message_id": resultado["result"]["message_id"],
                 "file_id": fid,
-                "bot_alias": BOT_ALIAS,
+                "bot_alias": item.get("bot_alias"),
             },
         )
         print(f"archivado {oid}")
