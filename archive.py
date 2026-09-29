@@ -37,6 +37,20 @@ import urllib.request
 BACKEND = os.environ["BACKEND_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
+# **Se comprueba que la URL sea una URL.** Sin esto, una variable vacia -o el
+# nombre equivocado en el workflow- produce `unknown url type:
+# '/storage/api/archive/claim'`, que no dice en ningun momento que falto
+# `BACKEND_URL`. Se perdio una corrida averiguando que el workflow leia `vars`
+# y el valor estuviera dado de alta como `secrets`.
+if not BACKEND.startswith("http"):
+    print(
+        f"FALLO: BACKEND_URL no es una URL valida: {BACKEND!r}.\n"
+        "Revisa que exista en el repo Y que el workflow la lea del sitio "
+        "correcto (secrets o vars).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 # **El token del bot y su canal NO viven aqui.** Los entrega `/claim`, resueltos
 # desde la base del backend. Duplicarlos en Infisical crearia dos fuentes de
 # verdad: rotar una no rotaria la otra, y el fallo apareceria como
@@ -71,7 +85,14 @@ API = f"{BACKEND}/storage/api/archive"
 
 
 def _call(path: str, payload: dict) -> dict:
-    """Llamada al backend, con el token de worker."""
+    """Llamada al backend, con el token de worker.
+
+    **Traduce los fallos de HTTP a mensajes.** `urlopen` lanza `HTTPError` en
+    cualquier respuesta >= 400, y sin atraparlo una credencial mal puesta sale
+    como un traceback de treinta lineas que no dice cual fue el codigo ni que
+    contesto el servidor. Los tres casos que importan -token de worker malo,
+    backend dormido, y error del servidor- se distinguen de un vistazo.
+    """
     req = urllib.request.Request(
         f"{API}{path}",
         data=json.dumps(payload).encode(),
@@ -81,8 +102,27 @@ def _call(path: str, payload: dict) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read() or "{}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read() or "{}")
+    except urllib.error.HTTPError as exc:
+        cuerpo = exc.read().decode("utf-8", "replace")[:300]
+        if exc.code == 403:
+            raise RuntimeError(
+                f"el backend rechazo el token de worker (403). Comprueba que "
+                f"WORKER_TOKEN sea el mismo en el workflow y en Infisical. {cuerpo}"
+            ) from exc
+        if exc.code == 503:
+            raise RuntimeError(
+                f"el backend responde 503: {cuerpo}. Normalmente es que Render "
+                "esta despertando, o que falta SERVER_PASSWORD."
+            ) from exc
+        raise RuntimeError(f"el backend devolvio {exc.code}: {cuerpo}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"no se pudo hablar con {API}: {exc.reason}. Si Render esta dormido, "
+            "la primera peticion tarda hasta un minuto en despertarlo."
+        ) from exc
 
 
 def _download(url: str, destino: str) -> int:
