@@ -314,16 +314,27 @@ def _archive_via_mtproto(item: dict, destino: str) -> int:
     usuario, asi que no hay bot del pool que lo firme, y el `file_id` de MTProto
     no es el de la Bot API: para recuperarlo hace falta la misma sesion y el
     `message_id`. Se guardan los dos.
+
+    **Y el canal es otro.** La cuenta de usuario no es miembro del canal del bot
+    -`storage-07`-, asi que los grandes van al canal principal del servidor, que
+    el backend entrega en `big_chat_id`.
     """
     oid = item["id"]
-    print(f"archivo grande ({item['size']} bytes): se archiva por MTProto")
+    chat_id = item.get("big_chat_id") or item["chat_id"]
+    print(f"archivo grande ({item['size']} bytes): se archiva por MTProto en {chat_id}")
+
+    if not chat_id:
+        motivo = "el backend no entrego canal para los archivos grandes"
+        print(motivo, file=sys.stderr)
+        _call(f"/{oid}/release", {"error": motivo})
+        return 1
 
     try:
         escrito = _download(item["download_url"], destino)
         print(f"bajados {escrito} bytes")
 
         resultado = asyncio.run(
-            mtproto_upload.upload(destino, item["filename"], item["chat_id"])
+            mtproto_upload.upload(destino, item["filename"], chat_id)
         )
         print(f"subido por MTProto -> message_id={resultado['message_id']}")
 
@@ -331,9 +342,7 @@ def _archive_via_mtproto(item: dict, destino: str) -> int:
         # recuperar **antes** de soltar R2. Aqui importa mas todavia, porque un
         # video de 1 GB es lo que mas duele perder.
         asyncio.run(
-            mtproto_upload.verify_downloadable(
-                item["chat_id"], resultado["message_id"], item["size"]
-            )
+            mtproto_upload.verify_downloadable(chat_id, resultado["message_id"], item["size"])
         )
 
         _reportar_archivado(
@@ -342,21 +351,29 @@ def _archive_via_mtproto(item: dict, destino: str) -> int:
             # Vacio a proposito: el `file_id` de MTProto no sirve por la Bot API,
             # y guardar uno que no funciona seria peor que no guardar ninguno.
             file_id=None,
+            chat_id=chat_id,
         )
         return 0
     except Exception as exc:  # noqa: BLE001 - Telethon lanza tipos variados
         # Se atrapa ancho a proposito: Telethon lanza `RPCError`, `FloodWaitError`
         # y errores de red propios, y enumerarlos todos dejaria escapar el que no
-        # se previo. Lo que importa es que **el reclamo se suelte siempre**: si
+        # se preveo. Lo que importa es que **el reclamo se suelte siempre**: si
         # se escapa, la fila queda en `archiving` hasta que venza el lease.
         _soltar(oid, exc)
         return 1
 
 
-def _reportar_archivado(item: dict, *, message_id: int, file_id: str | None) -> None:
-    """Le dice al backend que el objeto ya vive en Telegram."""
+def _reportar_archivado(
+    item: dict, *, message_id: int, file_id: str | None, chat_id: str | None = None
+) -> None:
+    """Le dice al backend que el objeto ya vive en Telegram.
+
+    `chat_id` se pasa explicito en el camino MTProto porque el destino no es el
+    canal del bot. Si se guardara el del bot, el `message_id` apuntaria a un
+    mensaje que no existe ahi y el archivo seria irrecuperable.
+    """
     cuerpo = {
-        "chat_id": item["chat_id"],
+        "chat_id": chat_id or item["chat_id"],
         "message_id": message_id,
         "file_id": file_id,
         "bot_alias": item.get("bot_alias"),

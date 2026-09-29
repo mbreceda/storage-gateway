@@ -81,6 +81,7 @@ async def upload(
     """
     from telethon import TelegramClient
     from telethon.sessions import StringSession
+    from telethon.tl.types import DocumentAttributeFilename
 
     api_id, api_hash, sesion = _credenciales()
 
@@ -106,11 +107,15 @@ async def upload(
         mensaje = await cliente.send_file(
             entity=entidad,
             file=ruta,
-            file_name=filename,
             caption=filename,
             # Sin esto Telegram intenta tratarlo como video y rechaza los
             # formatos que no reconoce.
             force_document=True,
+            # **`file_name` no basta.** Comprobado: Telethon lo ignora y usa el
+            # nombre del archivo en disco, asi que un archivo temporal llegaba a
+            # Telegram como `tmpjas2ksvo.bin` en vez de su nombre real. El
+            # atributo si manda.
+            attributes=[DocumentAttributeFilename(filename)],
         )
         if not mensaje or not mensaje.file:
             raise RuntimeError("Telegram acepto el envio pero no devolvio archivo")

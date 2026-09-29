@@ -90,6 +90,9 @@ def _item(oid, *, tam, url, bot_token="btok", chat_id="-100999", alias="bot-07")
         "content_type": None, "r2_key": "k",
         "download_url": f"http://127.0.0.1:{port}/{url}",
         "bot_alias": alias, "bot_token": bot_token, "chat_id": chat_id,
+        # Destino de los grandes: la cuenta de usuario no es miembro del canal
+        # del bot, asi que MTProto publica en el canal principal.
+        "big_chat_id": "-1004395494685",
     }
 
 
@@ -158,7 +161,11 @@ def caso_archivo_grande_por_mtproto():
     assert cuerpo["file_id"] is None, (
         "el file_id de MTProto no sirve por la Bot API: no debe guardarse uno falso"
     )
-    print("OK: 30 MB va por MTProto y no guarda un file_id falso")
+    assert SUBIDAS_MTPROTO[0][1] == "-1004395494685", (
+        f"debe publicar en el canal de los grandes, no en {SUBIDAS_MTPROTO[0][1]}")
+    assert cuerpo["chat_id"] == "-1004395494685", (
+        "el done debe guardar el canal real, o el message_id apuntaria a otro sitio")
+    print("OK: 30 MB va por MTProto al canal de los grandes, sin file_id falso")
 
 
 def caso_pasa_el_tope_de_mtproto():
