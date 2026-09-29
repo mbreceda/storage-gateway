@@ -17,6 +17,9 @@ jobs:
           identity-id: 7a11e24f-b33c-4c4c-a83d-7b1d75cb80c9
           project-slug: tgm-media-server
           env-slug: dev
+          # **Sin esto el action pide un token con la audiencia por defecto
+          # (`https://github.com/<owner>`), y la identidad de Infisical espera
+          # `infisical`: devuelve 401 "OIDC audience not allowed".
 
       - name: Confirmar que llego un secreto (sin imprimirlo)
         run: |
