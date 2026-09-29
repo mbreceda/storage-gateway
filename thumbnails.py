@@ -350,7 +350,14 @@ def _una(item: dict) -> bool:
             # un minuto. Se comprobo: 4 archivos de 3 a 18 MB quedaron
             # descartados por eso.
             if "too big" in motivo:
-                _descartar(uuid, tam, f"pasa el tope de 20 MB de la Bot API ({motivo})")
+                # **Mensaje limpio, sin repetir el error crudo.** El motivo ya
+                # dice lo que pasa; pegarle el `RuntimeError: ...` detras lo
+                # hacia ilegible y ocupaba dos lineas en el log.
+                _descartar(
+                    uuid, tam,
+                    f"pasa el tope de 20 MB de la Bot API y la sesion no ve su canal "
+                    f"({tam // (1024 * 1024)} MB)",
+                )
                 return False
             print("    (no se descarta: el fallo puede ser transitorio)", file=sys.stderr)
             return False
