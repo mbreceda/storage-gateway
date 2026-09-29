@@ -354,11 +354,19 @@ def _archive_via_mtproto(item: dict, destino: str) -> int:
             chat_id=chat_id,
         )
         return 0
-    except Exception as exc:  # noqa: BLE001 - Telethon lanza tipos variados
+    except BaseException as exc:  # noqa: BLE001 - Telethon lanza tipos variados
         # Se atrapa ancho a proposito: Telethon lanza `RPCError`, `FloodWaitError`
         # y errores de red propios, y enumerarlos todos dejaria escapar el que no
         # se preveo. Lo que importa es que **el reclamo se suelte siempre**: si
         # se escapa, la fila queda en `archiving` hasta que venza el lease.
+        #
+        # **`BaseException` y no `Exception`.** Con `Exception` se escapo un
+        # `SystemExit` y el runner murio sin imprimir nada: el log decia
+        # `bajados N bytes` y despues `exit code 1`, sin causa. Cuando el fallo
+        # no deja rastro, el rastro hay que forzarlo.
+        import traceback
+
+        traceback.print_exc()
         _soltar(oid, exc)
         return 1
 
