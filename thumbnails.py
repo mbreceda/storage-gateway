@@ -318,10 +318,22 @@ def _una(item: dict) -> bool:
                 _subir(uuid, jpeg)
                 print(f"    ok por Bot API, {len(jpeg)} bytes")
                 return True
-        except Exception as exc:  # noqa: BLE001 - se reporta y se descarta
+        except Exception as exc:  # noqa: BLE001 - se reporta; puede ser transitorio
             motivo = f"{type(exc).__name__}: {_limpiar(exc)}"
             print(f"    fallo por Bot API: {motivo}", file=sys.stderr)
-            _descartar(uuid, tam, f"la Bot API no pudo ({motivo})")
+            # **Solo se descarta lo DEFinitivo.** El tope de 20 MB no cambia: un
+            # archivo que lo pasa nunca se podra bajar por aqui, y reintentarlo
+            # cada 30 minutos es un bucle.
+            #
+            # Un fallo al resolver el bot, en cambio, puede ser transitorio -un
+            # bot caido, un backend sin desplegar-. Marcarlo como definitivo
+            # dejaria el archivo sin miniatura para siempre por un problema de
+            # un minuto. Se comprobo: 4 archivos de 3 a 18 MB quedaron
+            # descartados por eso.
+            if "too big" in motivo:
+                _descartar(uuid, tam, f"pasa el tope de 20 MB de la Bot API ({motivo})")
+                return False
+            print("    (no se descarta: el fallo puede ser transitorio)", file=sys.stderr)
             return False
         finally:
             for ruta in (src, frame):
@@ -361,11 +373,22 @@ def _una(item: dict) -> bool:
     # "el indice esta al final" de "ffmpeg esta roto": sin los tamanos probados,
     # los dos casos se ven igual y ninguno se puede diagnosticar.
     probados = ", ".join(f"{mb} MB" for mb in INTENTOS_MB)
-    _descartar(
-        uuid, tam,
-        f"sin frame con {probados}; probablemente el indice esta al final "
-        f"y no se puede muestrear sin bajarlo entero",
-    )
+    # **Solo se descarta si el video es chico.** Con 20 MB probados, un archivo
+    # de 25 MB puede perfectamente tener el indice mas alla: descartarlo seria
+    # rendirse antes de intentarlo. Los grandes se dejan pendientes para el
+    # worker de casa, que tiene el video entero.
+    if tam <= max(INTENTOS_MB) * 1024 * 1024:
+        _descartar(
+            uuid, tam,
+            f"sin frame con {probados} en un archivo de {tam // (1024*1024)} MB: "
+            "el indice esta al final o el video no es muestreable",
+        )
+    else:
+        print(
+            f"    sin frame con {probados}, pero el archivo tiene "
+            f"{tam // (1024*1024)} MB: se deja pendiente para el worker de casa",
+            file=sys.stderr,
+        )
     return False
 
 
