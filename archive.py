@@ -221,6 +221,23 @@ def _verificar_bajada(bot_token: str, file_id: str, subido: int) -> None:
     print(f"verificado: Telegram puede entregarlo ({tam} bytes)")
 
 
+def _limpiar(exc: Exception) -> str:
+    """El mensaje de error sin el nombre del archivo.
+
+    **Los nombres son el titulo del video y los logs son publicos.** Telegram
+    devuelve el nombre en algunos errores -`Bad Request: ... "titulo.mp4"`-, asi
+    que recortar los prints no basta.
+
+    Se conserva la causa -`chat not found`, `file is too big`-, que es lo que
+    sirve para diagnosticar y no identifica nada.
+    """
+    import re
+
+    texto = str(exc)
+    texto = re.sub(r"/tmp/[0-9a-f]{8,}[^\s:)\]}]*(\s+[^\s:)\]}]+)*", "/tmp/<archivo>", texto)
+    return texto[:300]
+
+
 def _claim() -> dict | None:
     """Toma el siguiente objeto, o `None` si la cola esta vacia."""
     return _call("/claim", {"worker_id": WORKER_ID, "lease_seconds": 3600}).get("item")
@@ -235,6 +252,7 @@ def _archive_one(item: dict) -> int:
     """
     oid = item["id"]
     tam = item["size"]
+    # **El nombre no se imprime.** Ver `_limpiar`.
     print(f"reclamado {oid} ({tam} bytes) de {item['project']}")
 
     if tam > mtproto_upload.MAX_MTPROTO_BYTES:
@@ -251,7 +269,10 @@ def _archive_one(item: dict) -> int:
         return 1
 
     grande = tam > mtproto_upload.MAX_BOT_API_BYTES
-    destino = f"/tmp/{oid}_{item['filename']}"
+    # **Sin el nombre en la ruta.** Los logs de un repo publico son publicos, y
+    # los nombres de estos archivos son el titulo del video: un error de ffmpeg
+    # o de R2 imprime la ruta completa. El uuid basta para encontrarlo.
+    destino = f"/tmp/{oid}.bin"
     try:
         if grande:
             return _archive_via_mtproto(item, destino)

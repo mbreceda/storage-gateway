@@ -81,6 +81,28 @@ if not BACKEND.startswith("http"):
     sys.exit(1)
 
 
+def _limpiar(exc: Exception) -> str:
+    """El mensaje de error sin el nombre del archivo.
+
+    **Los nombres son el titulo del video y los logs son publicos.** Un error de
+    ffmpeg o de R2 arrastra la ruta completa -`/tmp/<uuid>_<titulo>.mp4`-, asi
+    que recortar el print no basta: hay que limpiar el mensaje.
+
+    Se deja el resto del texto: la causa -`Invalid data found`, `403`- es lo que
+    sirve para diagnosticar, y eso no identifica a nadie.
+    """
+    import re
+
+    texto = str(exc)
+    # **Hasta el final de la ruta, no hasta el primer espacio.** Un nombre con
+    # espacios -`/tmp/abc12345_Mi Video Secreto.mkv`- dejaba el resto a la vista
+    # si se cortaba en el espacio. Se para en lo que delimita una ruta: dos
+    # puntos, comilla, parentesis, o el final de la cadena.
+    texto = re.sub(r"/tmp/[0-9a-f]{8,}[^\s:)\]}]*(\s+[^\s:)\]}]+)*", "/tmp/<archivo>", texto)
+    # Y por si el nombre viaja suelto, se recorta a lo que aporta.
+    return texto[:160]
+
+
 def _headers() -> dict:
     return {"X-Worker-Token": WORKER_TOKEN}
 
@@ -273,9 +295,11 @@ def _subir(uuid: str, jpeg: bytes) -> None:
 def _una(item: dict) -> bool:
     """Genera la miniatura de un video. `False` si no se pudo."""
     uuid = item["uuid"]
-    nombre = item.get("name") or uuid
     tam = int(item.get("size") or 0)
-    print(f"  {uuid[:12]} {nombre[:45]} ({tam // (1024 * 1024)} MB)")
+    # **El nombre NO se imprime.** Los logs de GitHub Actions de un repo publico
+    # son publicos, y los nombres de estos archivos son el titulo del video.
+    # El uuid y el tamano bastan para diagnosticar.
+    print(f"  {uuid[:12]} ({tam // (1024 * 1024)} MB)")
 
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg no esta instalado en el runner")
@@ -295,7 +319,7 @@ def _una(item: dict) -> bool:
                 print(f"    ok por Bot API, {len(jpeg)} bytes")
                 return True
         except Exception as exc:  # noqa: BLE001 - se reporta y se descarta
-            motivo = f"{type(exc).__name__}: {str(exc)[:140]}"
+            motivo = f"{type(exc).__name__}: {_limpiar(exc)}"
             print(f"    fallo por Bot API: {motivo}", file=sys.stderr)
             _descartar(uuid, tam, f"la Bot API no pudo ({motivo})")
             return False
@@ -321,7 +345,7 @@ def _una(item: dict) -> bool:
             print(f"    ok, {len(jpeg)} bytes")
             return True
         except Exception as exc:  # noqa: BLE001 - un video malo no corta el lote
-            print(f"    fallo: {type(exc).__name__}: {str(exc)[:160]}", file=sys.stderr)
+            print(f"    fallo: {type(exc).__name__}: {_limpiar(exc)}", file=sys.stderr)
             return False
         finally:
             for ruta in (src, frame):
