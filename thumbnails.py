@@ -416,6 +416,11 @@ def _una(item: dict) -> bool:
     return False
 
 
+# Motivos de descarte por uuid, para el resumen final. Se usa en vez de un
+# contador global porque el bucle no sabe por que fallo cada uno.
+_DESCARTES: dict[str, str] = {}
+
+
 def _descartar(uuid: str, tam: int, motivo: str) -> None:
     """Avisa al backend de que no se pudo. **Es lo que evita el bucle.**
 
@@ -424,6 +429,7 @@ def _descartar(uuid: str, tam: int, motivo: str) -> None:
     un bucle que gasta ancho de banda sin avanzar nunca.
     """
     print(f"    {motivo}", file=sys.stderr)
+    _DESCARTES[uuid] = motivo
     try:
         httpx.post(
             f"{BACKEND}/jobs/worker/files/{uuid}/thumbnail-failed",
@@ -497,13 +503,25 @@ def main() -> int:
         if _una(item):
             hechas += 1
 
-    print(f"\n{hechas} de {len(pendientes)} listas")
+    # Cuantos se descartaron por no tener camino. **Se cuentan por el motivo y
+    # no restando**, porque un fallo transitorio tampoco es "hecho" y restarlo
+    # daria un numero que no significa nada.
+    sin_camino = sum(1 for m in _DESCARTES.values() if m.startswith("sin "))
+    print(
+        f"\n{hechas} de {len(pendientes)} listas"
+        + (f" ({sin_camino} sin camino)" if sin_camino else "")
+    )
 
     # **Fallar en TODAS es un fallo sistemico, y debe verse rojo.** Un video
     # corrupto no debe marcar la corrida: el cron vuelve en 30 minutos. Pero si
     # fallan las 50, algo esta roto -ffmpeg sin instalar, R2 sin permisos- y una
     # corrida verde lo esconderria: se ve igual que "no habia nada que hacer".
-    if pendientes and hechas == 0:
+    #
+    # **Salvo que ninguna tuviera camino.** "Sin file_id y MTProto no ve el
+    # canal" no es un fallo del cron: es trabajo que ya no existe. Marcarlo rojo
+    # haria que cada corrida parezca rota mientras se drenan los pendientes
+    # inalcanzables, y un rojo que no significa nada se deja de mirar.
+    if pendientes and hechas == 0 and sin_camino < len(pendientes):
         print(
             f"FALLO: ninguna de las {len(pendientes)} miniaturas se pudo generar. "
             "Con una sola seria un archivo raro; con todas, algo esta roto.",
