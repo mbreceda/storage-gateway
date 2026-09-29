@@ -156,6 +156,46 @@ def _bajar_inicio(item: dict, largo: int, destino: str) -> int:
     return escrito
 
 
+def _bajar_bot_api(item: dict, destino: str) -> int:
+    """Baja el archivo por la Bot API del backend. Respaldo de MTProto.
+
+    **Existe porque la sesion del cron no es miembro de todos los canales.** El
+    canal del bot `primary` es donde vive la mayor parte de la biblioteca, y la
+    cuenta de usuario no esta dentro: MTProto responde "Could not find the input
+    entity" y no hay nada que hacer desde aqui.
+
+    La Bot API si funciona en ese caso, con su tope de 20 MB. Es justo el tope
+    que el camino MTProto existe para superar, asi que este respaldo cubre los
+    archivos chicos y deja los grandes al worker de casa.
+
+    **El `file_id` solo sirve con el bot que subio el archivo**, y el backend
+    entrega su token resuelto por canal en `bot_token`.
+    """
+    token = item.get("bot_token")
+    file_id = item.get("file_id")
+    if not token or not file_id:
+        raise RuntimeError("sin bot_token o file_id: no se puede usar la Bot API")
+
+    info = urllib.request.urlopen(
+        f"https://api.telegram.org/bot{token}/getFile?file_id={urllib.parse.quote(file_id)}",
+        timeout=60,
+    )
+    datos = json.loads(info.read())
+    if not datos.get("ok"):
+        raise RuntimeError(f"getFile fallo: {datos.get('description')}")
+
+    ruta_remota = datos["result"]["file_path"]
+    with urllib.request.urlopen(
+        f"https://api.telegram.org/file/bot{token}/{ruta_remota}", timeout=300
+    ) as r, open(destino, "wb") as fh:
+        while True:
+            trozo = r.read(1024 * 1024)
+            if not trozo:
+                break
+            fh.write(trozo)
+    return os.path.getsize(destino)
+
+
 def _frame(src: str) -> str | None:
     """Saca un frame con ffmpeg. El segundo 1, o el 0 si el video es corto.
 
@@ -224,6 +264,29 @@ def _una(item: dict) -> bool:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg no esta instalado en el runner")
 
+    # **Primero por la Bot API si MTProto no puede con ese canal.** Se prueba el
+    # respaldo de entrada cuando sabemos que la sesion no es miembro, en vez de
+    # gastar los intentos de MTProto fallando.
+    if item.get("sin_mtproto"):
+        src = tempfile.mktemp(suffix=".bin")
+        frame = None
+        try:
+            _bajar_bot_api(item, src)
+            frame = _frame(src)
+            if frame:
+                jpeg = _jpeg(frame)
+                _subir(uuid, jpeg)
+                print(f"    ok por Bot API, {len(jpeg)} bytes")
+                return True
+        except Exception as exc:  # noqa: BLE001 - se reporta y se descarta
+            print(f"    fallo por Bot API: {type(exc).__name__}: {str(exc)[:140]}", file=sys.stderr)
+        finally:
+            for ruta in (src, frame):
+                if ruta and os.path.exists(ruta):
+                    os.unlink(ruta)
+        _descartar(uuid, tam, "la Bot API tampoco pudo: puede pasar de 20 MB o el file_id no sirve")
+        return False
+
     for mb in INTENTOS_MB:
         src = tempfile.mktemp(suffix=".bin")
         frame = None
@@ -254,19 +317,78 @@ def _una(item: dict) -> bool:
     # "el indice esta al final" de "ffmpeg esta roto": sin los tamanos probados,
     # los dos casos se ven igual y ninguno se puede diagnosticar.
     probados = ", ".join(f"{mb} MB" for mb in INTENTOS_MB)
-    motivo = (
+    _descartar(
+        uuid, tam,
         f"sin frame con {probados}; probablemente el indice esta al final "
-        f"y no se puede muestrear sin bajarlo entero ({tam // (1024 * 1024)} MB)"
+        f"y no se puede muestrear sin bajarlo entero",
     )
+    return False
+
+
+def _descartar(uuid: str, tam: int, motivo: str) -> None:
+    """Avisa al backend de que no se pudo. **Es lo que evita el bucle.**
+
+    Sin esto el video vuelve en cada corrida: el cron baja 25 MB, falla, y
+    empieza de nuevo en 30 minutos. Con unos pocos asi, el cron se convierte en
+    un bucle que gasta ancho de banda sin avanzar nunca.
+    """
     print(f"    {motivo}", file=sys.stderr)
     try:
         httpx.post(
             f"{BACKEND}/jobs/worker/files/{uuid}/thumbnail-failed",
-            headers=_headers(), json={"error": motivo}, timeout=60,
+            headers=_headers(), json={"error": motivo[:200]}, timeout=60,
         )
     except Exception as exc:  # noqa: BLE001 - no poder avisar no cambia el resultado
         print(f"    (no se pudo marcar como descartada: {exc})", file=sys.stderr)
-    return False
+
+
+def _canales_visibles(pendientes: list[dict]) -> None:
+    """Marca que items tienen que ir por la Bot API.
+
+    **Se comprueba una vez por canal, no por archivo.** La sesion de MTProto no
+    es miembro de todos los canales -el del bot `primary` es el caso claro-, y
+    descubrirlo fallando cuesta intentos y ruido en el log. Con 235 archivos en
+    ese canal, serian 235 fallos identicos.
+    """
+    import asyncio
+
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    canales = sorted({i["chat_id"] for i in pendientes if i.get("chat_id")})
+    if not canales:
+        return
+
+    visibles: dict[str, bool] = {}
+
+    async def _comprobar():
+        cliente = TelegramClient(
+            StringSession(os.environ["CRON_TG_SESSION"]),
+            int(os.environ["TG_API_ID"]),
+            os.environ["TG_API_HASH"],
+        )
+        await cliente.connect()
+        try:
+            for canal in canales:
+                try:
+                    await cliente.get_entity(int(canal))
+                    visibles[canal] = True
+                except Exception:  # noqa: BLE001 - no verlo es el caso normal aqui
+                    visibles[canal] = False
+        finally:
+            await cliente.disconnect()
+
+    asyncio.run(_comprobar())
+
+    for item in pendientes:
+        canal = item.get("chat_id")
+        if canal and not visibles.get(canal, False):
+            # MTProto no puede: se marca para que vaya por la Bot API de entrada.
+            item["sin_mtproto"] = True
+
+    ciegos = sum(1 for i in pendientes if i.get("sin_mtproto"))
+    if ciegos:
+        print(f"{ciegos} de {len(pendientes)} van por la Bot API: la sesion no ve su canal")
 
 
 def main() -> int:
@@ -276,6 +398,7 @@ def main() -> int:
         return 0
 
     print(f"generando {len(pendientes)} miniaturas...")
+    _canales_visibles(pendientes)
     hechas = 0
     for item in pendientes:
         if _una(item):
