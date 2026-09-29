@@ -37,19 +37,50 @@ proyecto ──PUT──> R2
               objeto archivado
 ```
 
-## El límite que condiciona todo
+## El límite que condiciona todo: 20 MB
 
-**La Bot API no sube más de 50 MB por `sendDocument`.** Verificado: 51 MB falla.
+**La Bot API no sube y baja los mismos tamaños:**
 
-El script **no trocea**. Un archivo troceado queda partido en Telegram y hay que
-recomponerlo en cada descarga, que es peor que no archivarlo.
+| Operación | Tope |
+|---|---|
+| `sendDocument` (subir) | 50 MB |
+| `getFile` (bajar) | **20 MB** |
 
-Si el archivo pasa de 50 MB, se suelta el reclamo con el motivo y **se queda en
-R2**. Es lo correcto: R2 tiene 10 GB gratis y **cero coste de salida**, y un
-archivo grande es justo el que más conviene tener ahí.
+Medido: 19 MB baja, 21 MB responde `Bad Request: file is too big`. Y 45 MB sube
+sin queja.
 
-Para archivos grandes de verdad habría que usar MTProto -que sube hasta 2 GB-,
-pero eso necesita una sesión de usuario, no un bot, y es otro trabajo.
+**El tope que manda es el de bajada.** Diseñar con el de 50 MB haría esto con un
+archivo de 30 MB:
+
+1. Sube a Telegram. OK.
+2. El backend borra la copia de R2. **Se pierde el original.**
+3. Un usuario pide el archivo. `getFile` dice `file is too big`.
+4. El archivo ya no existe en ningún sitio accesible.
+
+Ni un paso falla, y el log dice `archivado`. Por eso `MAX_BOT_API_BYTES` es
+**20 MB** y no 50.
+
+Los archivos mayores se quedan en R2: 10 GB gratis y cero coste de salida, y un
+video grande es justo el que más conviene tener ahí.
+
+### La red que atrapa el fallo
+
+El tope es una constante, y las constantes cambian: Telegram ha subido sus
+límites con los años. Así que además se **comprueba la bajada antes de soltar
+R2**.
+
+`_verificar_bajada()` llama a `getFile` —que no baja el archivo, solo pide su
+ruta y tamaño, y es donde Telegram aplica el tope— y compara el `file_size`. Si
+falla, el objeto se suelta en vez de marcarse archivado.
+
+Cuesta una llamada por archivo. Sin ella, un cambio de límite en Telegram
+significaría perder archivos en silencio.
+
+### Para archivos grandes de verdad
+
+Habría que usar MTProto, que sube **y baja** hasta 2 GB. Necesita una sesión de
+usuario (`TG_USER_SESSION`), no un bot. Es otro trabajo, y el worker local ya lo
+hace.
 
 ## Secretos
 
@@ -144,8 +175,8 @@ El script se puede correr contra un backend falso. Es lo que se hizo para
 verificarlo antes del primer despliegue: un `HTTPServer` que devuelve un objeto
 en `/claim`, un archivo en la URL de bajada, y un `sendDocument` falso.
 
-Comprueba los cuatro caminos: archivo normal, archivo que pasa de 50 MB,
-Telegram rechazando, y cola vacía.
+Comprueba los cinco caminos: archivo normal, archivo que pasa de 20 MB,
+Telegram rechazando, cola vacía, y sin bot.
 
 ## Errores conocidos
 
@@ -154,5 +185,6 @@ Telegram rechazando, y cola vacía.
 | `401 OIDC audience not allowed` | Falta `oidc-audience: infisical` en el action |
 | `chat not found` | El bot no es miembro del canal, o falta el prefijo `-100` |
 | `el backend no entrego bot para el alias` | El alias no existe en el pool, no tiene canal, o cambió `SECRET_KEY` |
+| `file is too big` en `getFile` | El archivo pasa de 20 MB: no se puede bajar |
 | `Request Entity Too Large` | El archivo pasa de 50 MB y llegó a Telegram |
 | Nada se archiva y el log dice "nada que archivar" | Los objetos están en `pending`: nunca se llamó a `/complete` |

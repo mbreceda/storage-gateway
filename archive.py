@@ -31,6 +31,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BACKEND = os.environ["BACKEND_URL"].rstrip("/")
@@ -41,9 +42,19 @@ WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 # verdad: rotar una no rotaria la otra, y el fallo apareceria como
 # `chat not found` sin pista del motivo.
 
-# Tope de la Bot API para `sendDocument`. **No es configurable**: si se sube, el
-# script empieza a trocear y deja objetos partidos en Telegram.
-MAX_BOT_API_BYTES = 50 * 1024 * 1024
+# Tope real de la Bot API, y **el que manda es el de bajada**.
+#
+# Subir acepta 50 MB -probado con 51-, pero bajar por `getFile` corta en 20:
+# medido, 19 MB pasa y 21 MB responde `Bad Request: file is too big`.
+#
+# **Archivar por encima de 20 MB seria perder el archivo.** Subiria bien, se
+# borraria de R2, y despues nadie podria bajarlo: el archivado pareceria
+# funcionar y el archivo quedaria inaccesible. Es un fallo silencioso y
+# destructivo, y por eso el tope se pone por el lado conservador.
+#
+# Los archivos mayores se quedan en R2. No es un problema: 10 GB gratis y cero
+# coste de salida, y un video grande es justo el que mas conviene tener ahi.
+MAX_BOT_API_BYTES = 20 * 1024 * 1024
 
 # Cuantos objetos procesa una corrida.
 #
@@ -139,6 +150,40 @@ def _file_id(resultado: dict) -> str:
     return doc.get("file_id") or ""
 
 
+def _verificar_bajada(bot_token: str, file_id: str, subido: int) -> None:
+    """Confirma que Telegram puede entregar el archivo. Lanza si no.
+
+    **Existe por un fallo real.** La Bot API sube hasta 50 MB pero solo baja 20:
+    medido, 19 MB pasa y 21 MB responde `file is too big`. Sin esta comprobacion,
+    un archivo de 30 MB subiria bien, el backend soltaria la copia de R2, y el
+    archivo quedaria inaccesible. El archivado pareceria haber funcionado.
+
+    `getFile` no baja el archivo: pide su ruta y su tamano, y es justo ahi donde
+    Telegram aplica el tope. Una llamada barata que atrapa el caso peor.
+
+    Se compara tambien el tamano: un `file_size` distinto del subido significa
+    que Telegram guardo otra cosa, y bajar ese archivo daria un truncado.
+    """
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{bot_token}/getFile?file_id={urllib.parse.quote(file_id)}"
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.loads(r.read())
+
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"Telegram acepto la subida pero no puede entregar el archivo: "
+            f"{data.get('description')}. Se deja en R2."
+        )
+    tam = data.get("result", {}).get("file_size")
+    if tam is not None and tam != subido:
+        raise RuntimeError(
+            f"Telegram guardo {tam} bytes y se subieron {subido}: "
+            "el archivo quedaria truncado. Se deja en R2."
+        )
+    print(f"verificado: Telegram puede entregarlo ({tam} bytes)")
+
+
 def _claim() -> dict | None:
     """Toma el siguiente objeto, o `None` si la cola esta vacia."""
     return _call("/claim", {"worker_id": WORKER_ID, "lease_seconds": 3600}).get("item")
@@ -192,6 +237,14 @@ def _archive_one(item: dict) -> int:
         fid = _file_id(resultado)
         if not fid:
             raise RuntimeError(f"Telegram no devolvio file_id: {resultado}")
+
+        # **Se comprueba que se puede bajar ANTES de soltar R2.** Este paso es la
+        # red que atrapa el fallo silencioso: si Telegram acepta la subida pero
+        # despues no entrega el archivo, soltar R2 perderia el archivo para
+        # siempre. `getFile` es la unica forma de saberlo sin bajarlo entero.
+        #
+        # Cuesta una llamada y salva el caso peor: archivar algo inaccesible.
+        _verificar_bajada(item["bot_token"], fid, item["size"])
 
         _call(
             f"/{oid}/done",

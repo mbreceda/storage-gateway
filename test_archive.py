@@ -22,7 +22,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
         if self.path == "/big":
-            b = b"x" * (60*1024*1024)
+            b = b"x" * (30*1024*1024)
         elif self.path == "/small":
             b = b"hola mundo\n"
         else:
@@ -41,7 +41,7 @@ class H(BaseHTTPRequestHandler):
 srv = HTTPServer(("127.0.0.1", 0), H)
 port = srv.server_address[1]
 COLA.extend([
-    {"id": "so_grande", "project": "p", "filename": "grande.mp4", "size": 60*1024*1024,
+    {"id": "so_grande", "project": "p", "filename": "grande.mp4", "size": 30*1024*1024,
      "content_type": None, "r2_key": "k", "download_url": f"http://127.0.0.1:{port}/big", "bot_alias": "bot-07",
      "bot_token": "btok", "chat_id": "-100999"},
     {"id": "so_chico", "project": "p", "filename": "chico.txt", "size": 11,
@@ -56,6 +56,9 @@ class T(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0)); self.rfile.read(n)
         self._json({"ok": True, "result": {"message_id": 42, "document": {"file_id": "FID-REAL"}}})
+    def do_GET(self):
+        # `getFile`: Telegram entrega la ruta y el tamano.
+        self._json({"ok": True, "result": {"file_path": "documents/x.txt", "file_size": 11}})
     def _json(self, obj):
         b = json.dumps(obj).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
@@ -80,6 +83,18 @@ def fake_upload(ruta, filename, bot_token, chat_id):
         return json.loads(r.read())
 archive._upload = fake_upload
 
+# `_verificar_bajada` habla con api.telegram.org, que no existe en el test.
+# Se sustituye por una version que usa el Telegram falso.
+_verify_real = archive._verificar_bajada
+def fake_verify(bot_token, fid, subido):
+    import urllib.request
+    with urllib.request.urlopen(f"http://127.0.0.1:{tport}/getFile", timeout=10) as r:
+        data = json.loads(r.read())
+    if not data.get("ok"):
+        raise RuntimeError(f"no se puede entregar: {data.get('description')}")
+    return None
+archive._verificar_bajada = fake_verify
+
 codigo = archive.main()
 print("\n--- resultado ---")
 # --- Caso: el backend no entrega bot ----------------------------------------
@@ -101,3 +116,27 @@ print("OK: sin bot suelta el reclamo y no lo archiva")
 
 for path, body, tok in LLAMADAS:
     print(f"  {path} token={tok} {json.dumps(body)[:110]}")
+
+# --- Caso: Telegram acepta la subida pero no puede entregarla -----------------
+# **El fallo silencioso y destructivo.** La Bot API sube hasta 50 MB pero solo
+# baja 20: si esto no se detecta, el objeto sale de R2 y el archivo queda
+# inaccesible para siempre. El archivado pareceria haber funcionado.
+LLAMADAS.clear()
+COLA.append({"id": "so_no_entregable", "project": "p", "filename": "y.txt", "size": 11,
+             "content_type": None, "r2_key": "k",
+             "download_url": f"http://127.0.0.1:{port}/small", "bot_alias": "bot-07",
+             "bot_token": "btok", "chat_id": "-100999"})
+
+def verify_que_falla(bot_token, fid, subido):
+    raise RuntimeError("Telegram acepto la subida pero no puede entregar el archivo: "
+                       "Bad Request: file is too big. Se deja en R2.")
+archive._verificar_bajada = verify_que_falla
+
+codigo = archive.main()
+print("\n--- no entregable ---")
+print("codigo de salida:", codigo)
+assert codigo == 1, "debe salir 1"
+assert any("release" in p for p, _, _ in LLAMADAS), "debe soltar el reclamo"
+assert not any("done" in p for p, _, _ in LLAMADAS), (
+    "**NO debe marcarlo archivado**: eso soltaria R2 y perderia el archivo")
+print("OK: no marca archivado lo que Telegram no puede entregar")
