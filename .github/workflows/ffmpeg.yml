@@ -1,0 +1,10 @@
+name: ffmpeg-check
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          which ffmpeg && ffmpeg -version | head -1
+          echo "---"
+          nproc && free -g | head -2 && df -h / | tail -1
