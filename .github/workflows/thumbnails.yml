@@ -1,0 +1,69 @@
+name: thumbnails
+
+# Genera las miniaturas de video que faltan, por lotes.
+#
+# Por que existe
+# --------------
+# El worker local las genera a demanda y las sube a R2, pero **se para cuando no
+# hace falta**: dejarlo corriendo sondea cada pocos segundos y mantiene Render
+# despierto 24/7, que son las 750 horas gratuitas del mes.
+#
+# Con el worker parado, cada video nuevo se queda con un placeholder. Este job es
+# la red: recoge los pendientes cada 30 minutos y los procesa por lotes, sin
+# depender de que haya alguien mirando ni de que la Mac este encendida.
+#
+# **No sustituye al worker.** El worker da inmediatez -cuando alguien sube un
+# video y lo mira, la miniatura esta en segundos-. Esto cubre lo que se quedo
+# atras.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# Una corrida a la vez: dos lotes simultaneos subirian las mismas miniaturas.
+concurrency:
+  group: thumbnails
+  cancel-in-progress: false
+
+jobs:
+  thumbnails:
+    runs-on: ubuntu-latest
+    # Por debajo del tope de 6 h de GitHub. Cada video tarda entre 5 y 30
+    # segundos; con el lote de 50, una corrida normal son minutos.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Leer secretos de Infisical (OIDC)
+        uses: Infisical/secrets-action@v1.0.9
+        with:
+          method: oidc
+          identity-id: 7a11e24f-b33c-4c4c-a83d-7b1d75cb80c9
+          project-slug: tgm-media-server-m1-kc
+          env-slug: dev
+          oidc-audience: infisical
+
+      - name: Instalar dependencias
+        # ffmpeg ya viene en el runner; esto es lo que no trae Python.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install --quiet pillow httpx
+
+      - name: Generar miniaturas pendientes
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          WORKER_TOKEN: ${{ env.WORKER_TOKEN }}
+          R2_ENDPOINT: ${{ env.R2_ENDPOINT }}
+          R2_BUCKET: ${{ env.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+        run: python thumbnails.py
