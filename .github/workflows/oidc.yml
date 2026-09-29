@@ -15,7 +15,7 @@ jobs:
         with:
           method: oidc
           identity-id: 7a11e24f-b33c-4c4c-a83d-7b1d75cb80c9
-          project-slug: tgm_services
+          project-slug: tgm-services
           env-slug: dev
           oidc-audience: infisical
           # **Sin esto el action pide un token con la audiencia por defecto
