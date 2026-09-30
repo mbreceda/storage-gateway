@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -117,26 +118,49 @@ def _headers() -> dict:
     return {"X-Worker-Token": WORKER_TOKEN}
 
 
-def _pendientes(limite: int) -> list[dict]:
-    """Los videos sin miniatura, segun el backend."""
+def _pendientes(limite: int, intentos: int = 4) -> list[dict]:
+    """Los videos sin miniatura, segun el backend. **Reintenta.**
+
+    **Render se duerme a los 15 minutos sin trafico.** La primera peticion lo
+    despierta y puede tardar hasta un minuto; si el timeout se agota a mitad, la
+    lectura lanza `TimeoutError` -que **no** es `URLError`-, y el script moria
+    con un traceback de treinta lineas en vez de reintentar.
+
+    Se reintenta con espera creciente: 5, 10, 20 segundos. Es lo que tarda en
+    despertar, y el cron corre cada 30 minutos: esperar un minuto no molesta.
+    """
     url = f"{BACKEND}/jobs/worker/thumbnails/pending?limit={limite}"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read()).get("items", [])
-    except urllib.error.HTTPError as exc:
-        cuerpo = exc.read().decode("utf-8", "replace")[:300]
-        if exc.code == 403:
-            raise RuntimeError(
-                f"el backend rechazo el token de worker (403). Comprueba que "
-                f"WORKER_TOKEN sea el mismo aqui y en Infisical. {cuerpo}"
-            ) from exc
-        raise RuntimeError(f"el backend devolvio {exc.code}: {cuerpo}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"no se pudo hablar con {BACKEND}: {exc.reason}. Si Render esta "
-            "dormido, la primera peticion tarda hasta un minuto en despertarlo."
-        ) from exc
+    for intento in range(1, intentos + 1):
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            # **Timeout generoso.** Despertar Render tarda hasta 60 s, y con 60
+            # justos cualquier lentitud lo dejaba fuera.
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read()).get("items", [])
+        except urllib.error.HTTPError as exc:
+            cuerpo = exc.read().decode("utf-8", "replace")[:300]
+            if exc.code == 403:
+                # Un token malo no se arregla reintentando.
+                raise RuntimeError(
+                    f"el backend rechazo el token de worker (403). Comprueba que "
+                    f"WORKER_TOKEN sea el mismo aqui y en Infisical. {cuerpo}"
+                ) from exc
+            if exc.code < 500 or intento == intentos:
+                raise RuntimeError(f"el backend devolvio {exc.code}: {cuerpo}") from exc
+            print(f"  el backend devolvio {exc.code}: reintento {intento}/{intentos}")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # **`TimeoutError` incluido.** Un timeout al leer la respuesta NO es
+            # `URLError`: escapa del manejo y mata el script con un traceback.
+            if intento == intentos:
+                raise RuntimeError(
+                    f"no se pudo hablar con {BACKEND}: {exc}. Si Render esta "
+                    "dormido, la primera peticion tarda hasta un minuto en despertarlo."
+                ) from exc
+            print(f"  sin respuesta ({type(exc).__name__}): reintento {intento}/{intentos}")
+        espera = 5 * (2 ** (intento - 1))
+        print(f"  esperando {espera}s antes de reintentar...")
+        time.sleep(espera)
+    return []
 
 
 def _bajar_inicio(item: dict, largo: int, destino: str) -> int:
